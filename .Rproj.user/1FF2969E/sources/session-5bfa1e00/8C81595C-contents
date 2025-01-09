@@ -1,0 +1,248 @@
+---
+title: "Activity Data"
+author: "Mallory Giesie"
+date: "2024-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading packages}
+library(readxl)
+library(writexl)
+library(openxlsx)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(purrr)
+library(here)
+library(zoo)
+library(stringr)
+library(data.table)
+```
+
+```{r defining global variables}
+month_columns <- c("october_2022", "november_2022", "december_2022",
+                   "january_2023", "february_2023", "march_2023", "april_2023",
+                   "may_2023", "june_2023", "july_2023", "august_2023", "september_2023")
+
+december_year <- 2022
+
+# defining global variables for the fuel codes 
+elect_code <- c("0001", "0002", "0086")
+renew_code <- c("0003", "0004", "0009", "0010", "0111", "0125", "0123", "0127", "0128", "0130")
+diesl_code <- c("0063", "0113")
+fuelo_code <- c("0024", "0025", "0103", "0110", "0112")
+natga_code <- c("0041", "0042", "0043", "0044", "0045", "0046", "0114", "0134")
+propa_code <- c("0030", "0105", "0029", "0104", "0124", "0133", "0674")
+npowa_code <- c("0074", "0094", "0135")
+powat_code <- c("0075", "0076", "0077", "0078", "0080", "0095", "0401", "0445")
+wood_code <- c("0106", "0107")
+b20_code <- "0120"
+
+# set the percent threshold for consumption estimation 
+consumptionThreshold <- 25
+
+#Change to current year's filepath
+meterdata_filepath <- here("FBMS_Data.xlsx")
+
+meter_data <- read_xlsx(meterdata_filepath,
+                        skip = 5,
+                        na = c("NULL", "#")) %>%
+  clean_names() %>%
+  select(-c(2, 5, 9, 28)) %>% mutate(Location = substring(`maximo_id`, 2))
+
+
+meter_data <- meter_data %>%
+  mutate(
+    energy_type_mapped = case_when(
+      energy_type %in% diesl_code ~ "DIESL",
+      energy_type %in% fuelo_code ~ "FUELO",
+      energy_type %in% natga_code ~ "NATGA",
+      energy_type %in% propa_code ~ "PROPA",
+      energy_type %in% wood_code ~ "WOOD",
+      energy_type == b20_code ~ "B-20",
+      TRUE ~ "UNMAPPED"  # Mark unmapped energy types
+    )
+  )
+
+meter_data <- meter_data %>%
+  mutate(
+    consumption = case_when(
+      # Natural Gas conversions
+      energy_type_mapped == "NATGA" & unit == "MCF"  ~ consumption,
+      energy_type_mapped == "NATGA" & unit == "CF"   ~ consumption / 1000,
+      energy_type_mapped == "NATGA" & unit == "TGAL" ~ consumption * 0.1337,
+      
+      # Diesel (DIESL) TGAL -> GAL
+      energy_type_mapped == "DIESL" & unit == "TGAL" ~ consumption * 1000,
+      
+      # Fuel Oil (FUELO) TGAL -> GAL
+      energy_type_mapped == "FUELO" & unit == "TGAL" ~ consumption * 1000,
+      
+      # Propane (PROPA) TGAL -> GAL
+      energy_type_mapped == "PROPA" & unit == "TGAL" ~ consumption * 1000,
+      
+      # Biodiesel (B-20) TGAL -> GAL
+      energy_type_mapped == "B-20" & unit == "TGAL"  ~ consumption * 1000,
+      
+      # Otherwise leave consumption unchanged
+      TRUE ~ consumption
+    ),
+    
+    unit = case_when(
+      # Always convert NATGA to MCF
+      energy_type_mapped == "NATGA" ~ "MCF",
+      
+      # For any of these fuel types, if unit was TGAL, rename to GAL
+      energy_type_mapped %in% c("DIESL", "FUELO", "PROPA", "B-20") & unit == "TGAL" ~ "GAL",
+      
+      # Otherwise keep the existing unit
+      TRUE ~ unit
+    )
+  )
+
+
+gis_info <- read_xlsx(here("gis_data.xlsx"), sheet = 'Sheet1', skip = 4) %>% select(Location, Occupant, `Asset Ownership`)
+
+meter_data <- left_join(meter_data, gis_info, by = "Location")
+
+meter_data <- meter_data %>%
+  filter(!energy_type_mapped %in% c("ELECT", "UNMAPPED")) %>% filter(unit != "FLAT RATE")
+
+
+meter_data <- meter_data %>%
+  mutate(Location = substr(maximo_id, 2, nchar(maximo_id)))
+
+meter_data <- meter_data %>%
+  mutate(
+    # Adjust consumption if it’s in thousands of gallons
+    consumption = case_when(
+      grepl("THOU\\.GAL", energy_type_description) ~ consumption * 1000,
+      TRUE ~ consumption
+    ),
+    
+    # Remap the 'energy_type_mapped' column based on description
+    energy_type_mapped = case_when(
+      grepl("DISTILLATE FUEL OIL NO\\. 1", energy_type_description) ~ "FUELO1",
+      grepl("DISTILLATE FUEL OIL NO\\. 2", energy_type_description) ~ "FUELO2",
+      grepl("GASOLINE", energy_type_description)                     ~ "GAS",
+      grepl("KEROSENE", energy_type_description)                     ~ "KEROSENE",
+      TRUE ~ energy_type_mapped  # for anything else, keep the old value
+    )
+  )
+```
+
+```{r}
+percent_filled <- meter_data %>% group_by(park, Occupant, `Asset Ownership`, energy_type_mapped, building_description, facility_type_description, unit, service_month, asset_code) %>% summarize(unique_months = n(), consumption = sum(consumption)) %>% ungroup() %>% mutate(unique_months = case_when(unique_months >= 1 ~ 1, unique_months < 1 ~ unique_months))
+
+monthly_percentage <-  percent_filled %>% group_by(park, Occupant, `Asset Ownership`, energy_type_mapped, building_description, facility_type_description, unit, asset_code) %>% summarize(consumption = sum(consumption), months_reported = n()) %>% mutate(percent_complete = months_reported/12) %>% ungroup() 
+
+total_reported <- monthly_percentage %>% 
+  mutate(
+    facility_type_description = case_when(
+      is.na(facility_type_description) ~ "Non-Housing",
+      facility_type_description == "Housing" ~ "Housing",
+      TRUE ~ "Non-Housing"
+    ),
+    Occupant = ifelse(Occupant %in% c("NPS", "CONCESSION"), Occupant, "MISC"),
+    asset_type = case_when(
+      asset_code == "4100" ~ "Building",
+      TRUE ~ "Non-Building"
+    )
+  ) %>% mutate(
+    facility_type_description = if_else(
+      facility_type_description == "Non-Housing", 
+      asset_type,
+      facility_type_description
+    )
+  ) %>% select(-asset_type, asset_code) %>% group_by(park, Occupant,`Asset Ownership`, energy_type_mapped, facility_type_description) %>%
+  summarize(
+    total_consumption = sum(consumption), 
+    percent_completed = mean(percent_complete)
+  )
+```
+
+```{r}
+activity_data_cleaned <- total_reported %>%
+  # 1) Rename columns
+  rename(
+    Park            = park,
+    Owner           = `Asset Ownership`,
+    `Building Type` = facility_type_description,
+    Consumption     = total_consumption
+  ) %>%
+  
+  # 2) Add a 'year' column of all 2023
+  mutate(Year = 2023) %>%
+  
+  # 3) Map the 'energy_type_mapped' codes to descriptive names
+  mutate(
+    `Energy Type` = case_when(
+      energy_type_mapped == "NATGA"    ~ "Natural Gas",
+      energy_type_mapped == "PROPA"    ~ "Propane",
+      energy_type_mapped == "FUELO2"   ~ "Fuel Oil #2",
+      energy_type_mapped == "GAS"      ~ "Gasoline",
+      energy_type_mapped == "DIESL"    ~ "Diesel",
+      energy_type_mapped == "FUELO1"   ~ "Fuel Oil #1",
+      energy_type_mapped == "wood"     ~ "Wood",
+      energy_type_mapped == "B20"      ~ "Biodiesel",
+      energy_type_mapped == "KEROSENE" ~ "Kerosene",
+      TRUE                             ~ energy_type_mapped
+    )
+  ) %>%
+  
+  # 4) Add a Unit column based on the Energy Type
+  mutate(
+    Unit = case_when(
+      `Energy Type` == "Natural Gas" ~ "MCF",
+      `Energy Type` %in% c("Propane", "Fuel Oil #2", "Gasoline", "Diesel",
+                           "Fuel Oil #1", "Biodiesel", "Kerosene") ~ "Gallons",
+      `Energy Type` == "Wood"        ~ "Short tons",
+      TRUE                           ~ NA_character_
+    )
+  ) %>%
+  
+  # 5) Make 'Percent completed' = NA except for NATGA
+  mutate(
+    `Percent completed` = case_when(
+      energy_type_mapped == "NATGA" ~ percent_completed,
+      TRUE                          ~ NA_real_
+    )
+  ) %>% ungroup()
+
+activity_data_cleaned <- activity_data_cleaned %>% select(-percent_completed)
+activity_data_cleaned <- activity_data_cleaned %>% select(-energy_type_mapped)
+
+```
+
+```{r}
+# 1) Create three separate data frames:
+nps_df <- activity_data_cleaned %>%
+  filter(Occupant == "NPS")
+
+concessioner_df <- activity_data_cleaned %>%
+  filter(Occupant == "CONCESSION")
+
+misc_df <- activity_data_cleaned %>%
+  filter(Occupant == "MISC")
+
+# 2) Create a new workbook:
+wb <- createWorkbook()
+
+# 3) Add worksheets and write the data
+addWorksheet(wb, sheetName = "NPS Activity Data")
+writeData(wb, sheet = "NPS Activity Data", x = nps_df)
+
+addWorksheet(wb, sheetName = "Concessioner Activity Data")
+writeData(wb, sheet = "Concessioner Activity Data", x = concessioner_df)
+
+addWorksheet(wb, sheetName = "MISC Activity Data")
+writeData(wb, sheet = "MISC Activity Data", x = misc_df)
+
+# 4) Save workbook using here()
+saveWorkbook(wb, file = here::here("Activity_Data.xlsx"), overwrite = TRUE)
+```
+
